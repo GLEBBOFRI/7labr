@@ -14,12 +14,12 @@ public class RemoveLowerKey extends Command {
 
     @Override
     public Response execute(Request request) {
-        String arg = (String) request.getArguments();
-        if (arg == null || arg.isEmpty()) {
-            return new Response("а меньше какого ключа удалять-то будем?");
-        }
         try {
-            int key = Integer.parseInt(arg);
+            Object[] args = (Object[]) request.getArguments();
+            if (args == null || args.length == 0) {
+                return new Response("а меньше какого ключа удалять-то будем?");
+            }
+            int key = Integer.parseInt(args[0].toString());
             int removedCount = collectionManager.removeLowerKey(key);
             return new Response("удалено " + removedCount + " элементов с ключом меньше чем " + key);
         } catch (NumberFormatException e) {

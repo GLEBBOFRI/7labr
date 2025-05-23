@@ -14,6 +14,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ObjectInputStream;
+import java.io.Serializable;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
@@ -25,7 +26,7 @@ public class ClientMain {
     private static final int SERVER_PORT = 12345;
     private static final long RECONNECTION_DELAY_MS = 300;
     private static final int MAX_RECONNECTION_ATTEMPTS = 5;
-    private static final int BUFFER_SIZE = 8192;
+    private static final int BUFFER_SIZE = 8192; // этот размер буфера теперь в основном для начального чтения, а не для фиксированного размера сообщения
 
     private final Console console = new StandartConsole();
     private final CommandManager commandManager = new CommandManager();
@@ -43,9 +44,10 @@ public class ClientMain {
         commandManager.registerCommand(new ServerCommand("info", "показывает инфо о коллекциях"));
         commandManager.registerCommand(new ServerCommand("show", "показывает все элементы коллекции"));
         commandManager.registerCommand(new ServerCommand("insert", "добавляет новый элемент"));
-        commandManager.registerCommand(new ServerCommand("update", "обновляет элемент по айди"));
+        commandManager.registerCommand(new ServerCommand(
+                "update", "обновляет элемент по айди"));
         commandManager.registerCommand(new ServerCommand("remove_key", "удаляет элемент по айди"));
-                commandManager.registerCommand(new ServerCommand("clear", "очищает коллекцию"));
+        commandManager.registerCommand(new ServerCommand("clear", "очищает коллекцию"));
         commandManager.registerCommand(new ServerCommand("replace_if_greater", "замена если больше"));
         commandManager.registerCommand(new ServerCommand("remove_greater_key", "удаляет элементы с айди больше чем"));
         commandManager.registerCommand(new ServerCommand("remove_lower_key", "удаляет элементы с айди меньше чем"));
@@ -77,28 +79,72 @@ public class ClientMain {
         }
     }
 
-    private Response sendRequest(Request request) throws IOException, ClassNotFoundException {
+    /**
+     * отправляет запрос на сервер и получает ответ.
+     * этот метод теперь обрабатывает фрагментированные сетевые сообщения, сначала отправляя/читая длину сообщения,
+     * затем отправляя/читая фактическое содержимое сообщения в цикле, пока все байты не будут переданы.
+     *
+     * @param request объект запроса для отправки.
+     * @return объект ответа, полученный от сервера.
+     * @throws IOException если произошла ошибка сети или ввода-вывода.
+     * @throws ClassNotFoundException если класс ответа не может быть найден во время десериализации.
+     */
+    public Response sendRequest(Request request) throws IOException, ClassNotFoundException {
         if (socketChannel == null || !socketChannel.isConnected()) {
             throw new IOException("Not connected to the server.");
         }
 
-        // сериализуем запрос в байты
+        // этап 1: отправка запроса
+        // сериализуем объект запроса, включая его длину как 4-байтовый префикс.
         byte[] requestBytes = serialize(request);
-        ByteBuffer buffer = ByteBuffer.wrap(requestBytes);
-        socketChannel.write(buffer);
-        buffer.clear();
+        ByteBuffer sendBuffer = ByteBuffer.wrap(requestBytes);
 
-        // получаем и читаем ответ
-        ByteBuffer responseBuffer = ByteBuffer.allocate(BUFFER_SIZE);
-        int bytesRead = socketChannel.read(responseBuffer);
-        if (bytesRead == -1) {
-            throw new IOException("Server disconnected.");
+        // убеждаемся, что все байты запроса отправлены, даже если это потребует нескольких вызовов записи.
+        while (sendBuffer.hasRemaining()) {
+            socketChannel.write(sendBuffer);
         }
-        responseBuffer.flip();
+        sendBuffer.clear(); // очищаем буфер отправки для возможного повторного использования
+
+        // этап 2: получение ответа
+        // 1. сначала читаем 4 байта, чтобы узнать ожидаемую длину входящего ответа.
+        ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
+        while (lengthBuffer.hasRemaining()) {
+            int bytes = socketChannel.read(lengthBuffer);
+            if (bytes == -1) {
+                throw new IOException("Server disconnected while reading response length.");
+            }
+        }
+        lengthBuffer.flip(); // готовим буфер длины к чтению
+        int responseLength = lengthBuffer.getInt(); // получаем ожидаемую длину ответа
+
+        // базовая проверка длины ответа, чтобы избежать ошибок памяти или вредоносных данных.
+        // предполагаем разумный максимальный размер ответа (например, 10 мб).
+        if (responseLength <= 0 || responseLength > 10 * 1024 * 1024) {
+            throw new IOException("Invalid or excessive response length received: " + responseLength);
+        }
+
+        // 2. теперь читаем само содержимое ответа, пока не получим все ожидаемые байты.
+        ByteBuffer responseBuffer = ByteBuffer.allocate(responseLength);
+        int totalBytesRead = 0;
+        while (totalBytesRead < responseLength) {
+            int bytes = socketChannel.read(responseBuffer);
+            if (bytes == -1) {
+                throw new IOException("Server disconnected while reading response data.");
+            }
+            totalBytesRead += bytes;
+        }
+
+        responseBuffer.flip(); // готовим буфер ответа к чтению
+
+        // необязательно: проверяем, что количество прочитанных данных соответствует ожидаемой длине.
+        if (responseBuffer.remaining() != responseLength) {
+            throw new IOException("Incomplete response: expected " + responseLength + " bytes, but read " + responseBuffer.remaining());
+        }
+
         byte[] responseBytes = new byte[responseBuffer.remaining()];
         responseBuffer.get(responseBytes);
-        Response response = deserialize(responseBytes);
-        return response;
+
+        return deserialize(responseBytes);
     }
 
     private void connect() throws IOException {
@@ -108,7 +154,7 @@ public class ClientMain {
                 socketChannel = SocketChannel.open();
                 socketChannel.connect(new InetSocketAddress(SERVER_HOST, SERVER_PORT));
                 console.writeln("Connected to server at " + SERVER_HOST + ":" + SERVER_PORT);
-                return; // Успешное подключение, выходим из метода
+                return; // Successful connection, exit method
             } catch (IOException e) {
                 attempts++;
                 console.writeln("Failed to connect to server (attempt " + attempts + "/" + MAX_RECONNECTION_ATTEMPTS + "): " + e.getMessage());
@@ -123,7 +169,7 @@ public class ClientMain {
                 }
             }
         }
-        throw new IOException("Failed to connect after max attempts"); //Если дошли сюда и не вышли из цикла - ошибка
+        throw new IOException("Failed to connect after max attempts");
     }
 
     private void disconnect() {
@@ -145,12 +191,11 @@ public class ClientMain {
             while (true) {
                 try {
                     connect();
-                    break; // выход из бесконечного цикла при успешном подключении
+                    break;
                 } catch (IOException e) {
-                    console.writeln(e.getMessage()); // сообщение об ошибке подключения
+                    console.writeln(e.getMessage());
                 }
             }
-
 
             console.writeln("Type 'help' for command list");
 
@@ -194,18 +239,41 @@ public class ClientMain {
             console.writeln("Client stopped");
         }
     }
+
+    /**
+     * сериализует объект в массив байтов, добавляя в начало его длину (4 байта).
+     * это очень важно для сетевого протокола, чтобы знать, сколько байтов нужно прочитать.
+     * @param obj объект для сериализации.
+     * @return массив байтов, содержащий 4-байтовый префикс длины, за которым следует сериализованный объект.
+     * @throws IOException если произошла ошибка ввода-вывода во время сериализации.
+     */
     private static byte[] serialize(Object obj) throws IOException {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
              ObjectOutputStream oos = new ObjectOutputStream(bos)) {
             oos.writeObject(obj);
-            return bos.toByteArray();
+            byte[] objectBytes = bos.toByteArray();
+
+            // создаем новый буфер для хранения длины и данных
+            ByteBuffer buffer = ByteBuffer.allocate(4 + objectBytes.length);
+            buffer.putInt(objectBytes.length); // записываем длину объекта (4 байта)
+            buffer.put(objectBytes);           // затем сами байты объекта
+            return buffer.array();             // возвращаем полный массив байтов
         }
     }
 
-    private static Response deserialize(byte[] data) throws IOException, ClassNotFoundException {
+    /**
+     * десериализует массив байтов обратно в объект.
+     * этот метод предполагает, что входной массив байтов содержит только сериализованные данные объекта (без префикса длины).
+     * префикс длины обрабатывается логикой чтения сети в sendRequest.
+     * @param data массив байтов, содержащий сериализованный объект.
+     * @return десериализованный объект.
+     * @throws IOException если произошла ошибка ввода-вывода во время десериализации.
+     * @throws ClassNotFoundException если класс десериализованного объекта не может быть найден.
+     */
+    private static <T> T deserialize(byte[] data) throws IOException, ClassNotFoundException {
         try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
              ObjectInputStream ois = new ObjectInputStream(bis)) {
-            return (Response) ois.readObject();
+            return (T) ois.readObject();
         }
     }
 }

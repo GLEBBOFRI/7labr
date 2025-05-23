@@ -24,22 +24,31 @@ public class ReplaceIfGreater extends Command {
 
             Integer key;
             try {
-                key = Integer.parseInt((String) args[0]);
+                if (args[0] instanceof Integer) {
+                    key = (Integer) args[0];
+                } else {
+                    key = Integer.parseInt(args[0].toString());
+                }
             } catch (NumberFormatException e) {
                 return new Response("ключ-то числом будь добр введи");
             }
 
             City newCity;
             try {
-                newCity = (City) args[1];
+                if (args[1] instanceof City) {
+                    newCity = (City) args[1];
+                } else {
+                    return new Response("а город-то где? ты что-то не то передал");
+                }
             } catch (ClassCastException e) {
-                return new Response("а город-то где? ты что-то не то передал");
+                return new Response("город должен быть в правильном формате");
             }
 
             newCity.validate();
             if (!collectionManager.containsKey(key)) {
                 return new Response("нет такого ключа " + key + ", куда ты собрался заменять?");
             }
+
             if (collectionManager.replaceIfGreater(key, newCity)) {
                 return new Response("элемент с ключом " + key + " заменен, этот город круче");
             } else {
@@ -48,8 +57,6 @@ public class ReplaceIfGreater extends Command {
 
         } catch (ValidationException e) {
             return new Response("город у тебя какой-то бракованный: " + e.getMessage());
-        } catch (ClassCastException e) {
-            return new Response("ты что-то перепутал с типами аргументов");
         } catch (Exception e) {
             return new Response("ой, не получилось заменить, что-то сломалось: " + e.getMessage());
         }

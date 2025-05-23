@@ -14,12 +14,12 @@ public class RemoveGreaterKey extends Command {
 
     @Override
     public Response execute(Request request) {
-        String arg = (String) request.getArguments();
-        if (arg == null || arg.isEmpty()) {
-            return new Response("ключ-то где?");
-        }
         try {
-            int key = Integer.parseInt(arg);
+            Object[] args = (Object[]) request.getArguments();
+            if (args == null || args.length == 0) {
+                return new Response("ключ-то где?");
+            }
+            int key = Integer.parseInt(args[0].toString());
             int removedCount = collectionManager.removeGreaterKey(key);
             return new Response("удалено " + removedCount + " элементов с ключом больше чем " + key);
         } catch (NumberFormatException e) {

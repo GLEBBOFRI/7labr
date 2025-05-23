@@ -14,12 +14,12 @@ public class RemoveKey extends Command {
 
     @Override
     public Response execute(Request request) {
-        String arg = (String) request.getArguments();
-        if (arg == null || arg.isEmpty()) {
-            return new Response("ну и какой ключ удалять будем, умник?");
-        }
         try {
-            int key = Integer.parseInt(arg);
+            Object[] args = (Object[]) request.getArguments();
+            if (args == null || args.length == 0) {
+                return new Response("ну и какой ключ удалять будем, умник?");
+            }
+            int key = Integer.parseInt(args[0].toString());
             if (collectionManager.remove(key)) {
                 return new Response("элемент с ключом " + key + " тю-тю, удален");
             } else {

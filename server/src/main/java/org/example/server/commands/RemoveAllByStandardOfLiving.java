@@ -17,12 +17,12 @@ public class RemoveAllByStandardOfLiving extends Command {
 
     @Override
     public Response execute(Request request) {
-        String arg = (String) request.getArguments();
-        if (arg == null || arg.isEmpty()) {
-            return new Response("а уровень жизни-то где?");
-        }
         try {
-            StandardOfLiving standard = StandardOfLiving.valueOf(arg.toUpperCase());
+            Object[] args = (Object[]) request.getArguments();
+            if (args == null || args.length == 0) {
+                return new Response("а уровень жизни-то где?");
+            }
+            StandardOfLiving standard = StandardOfLiving.valueOf(args[0].toString().toUpperCase());
             int removedCount = collectionManager.removeAllByStandardOfLiving(standard);
             return new Response("удалено " + removedCount + " элементов с уровнем жизни " + standard);
         } catch (IllegalArgumentException e) {

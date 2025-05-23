@@ -17,16 +17,21 @@ public class FilterStartsWithName extends Command {
 
     @Override
     public Response execute(Request request) {
-        String prefix = (String) request.getArguments();
-        if (prefix == null || prefix.length() != 1) {
-            return new Response("ты что, одну букву ввести не можешь? нужен один аргумент: префикс");
-        }
-        List<City> filteredCities = collectionManager.filterStartsWithName(prefix);
-        if (filteredCities.isEmpty()) {
-            return new Response("нет тут городов, которые начинаются на '" + prefix + "'");
-        } else {
-            String data = filteredCities.stream().map(City::toString).collect(Collectors.joining("\n"));
-            return new Response("города, которые начинаются на '" + prefix + "':\n" + data, filteredCities);
+        try {
+            Object[] args = (Object[]) request.getArguments();
+            if (args == null || args.length == 0) {
+                return new Response("ты что, префикс ввести не можешь? нужен один аргумент");
+            }
+            String prefix = args[0].toString();
+            List<City> filteredCities = collectionManager.filterStartsWithName(prefix);
+            if (filteredCities.isEmpty()) {
+                return new Response("нет тут городов, которые начинаются на '" + prefix + "'");
+            } else {
+                String data = filteredCities.stream().map(City::toString).collect(Collectors.joining("\n"));
+                return new Response("города, которые начинаются на '" + prefix + "':\n" + data, filteredCities);
+            }
+        } catch (Exception e) {
+            return new Response("ошибка при фильтрации по имени: " + e.getMessage());
         }
     }
 }
