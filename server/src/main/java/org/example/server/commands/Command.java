@@ -2,11 +2,14 @@ package org.example.server.commands;
 
 import org.example.network.Request;
 import org.example.network.Response;
+import org.example.utils.IdGenerator;
+
 import java.util.Objects;
 
 public abstract class Command {
     private final String name;
     private final String description;
+    protected IdGenerator idGenerator;
 
     public Command(String name, String description) {
         this.name = name;

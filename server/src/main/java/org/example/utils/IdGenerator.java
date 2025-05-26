@@ -9,11 +9,16 @@ public class IdGenerator {
         }
         return nextId++;
     }
+    
 
     public synchronized void setNextId(int nextId) {
         if (nextId <= 0) {
             throw new IllegalArgumentException("ID должен быть положительным");
         }
         this.nextId = Math.max(this.nextId, nextId);
+    }
+
+    public synchronized void resetId() {
+        this.nextId = 1;
     }
 }

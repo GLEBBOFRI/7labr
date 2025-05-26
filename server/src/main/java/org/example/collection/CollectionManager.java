@@ -15,14 +15,17 @@ public class CollectionManager {
     private final Hashtable<Integer, City> collection = new Hashtable<>();
     private final IdGenerator idGenerator = new IdGenerator();
     private String saveFilePath;
-    private final ExecutorService saveExecutor = Executors.newSingleThreadExecutor(); // Один поток для сохранения
+    private final ExecutorService saveExecutor = Executors.newSingleThreadExecutor();
+
+    public CollectionManager() {
+    }
 
     public void loadCollection(String filePath) throws IOException, ValidationException {
         this.saveFilePath = filePath;
         List<City> cities = DumpManager.jsonFileToCityList(filePath);
 
         collection.clear();
-        idGenerator.setNextId(1);
+        idGenerator.resetId();
 
         for (City city : cities) {
             city.validate();
@@ -56,7 +59,7 @@ public class CollectionManager {
 
         int actualKey = (key != null) ? key : newId;
         collection.put(actualKey, city);
-        asyncSave(); 
+        asyncSave();
     }
 
     public boolean update(Integer key, City newCity) throws ValidationException, IOException {
@@ -67,14 +70,14 @@ public class CollectionManager {
         City oldCity = collection.get(key);
         newCity.setId(oldCity.getId());
         collection.put(key, newCity);
-        asyncSave(); 
+        asyncSave();
         return true;
     }
 
     public boolean remove(Integer key) throws IOException {
         boolean removed = collection.remove(key) != null;
         if (removed) {
-            asyncSave(); 
+            asyncSave();
         }
         return removed;
     }
@@ -84,7 +87,7 @@ public class CollectionManager {
         collection.keySet().removeIf(k -> k > key);
         int removed = initialSize - collection.size();
         if (removed > 0) {
-            asyncSave(); 
+            asyncSave();
         }
         return removed;
     }
@@ -94,7 +97,7 @@ public class CollectionManager {
         collection.keySet().removeIf(k -> k < key);
         int removed = initialSize - collection.size();
         if (removed > 0) {
-            asyncSave(); 
+            asyncSave();
         }
         return removed;
     }
@@ -104,14 +107,14 @@ public class CollectionManager {
         collection.values().removeIf(city -> standard.equals(city.getStandardOfLiving()));
         int removed = initialSize - collection.size();
         if (removed > 0) {
-            asyncSave(); 
+            asyncSave();
         }
         return removed;
     }
 
     public void clearCollection() throws IOException {
         collection.clear();
-        asyncSave(); 
+        asyncSave();
     }
 
     public boolean replaceIfGreater(Integer key, City newCity) throws ValidationException, IOException {
@@ -124,7 +127,7 @@ public class CollectionManager {
             newCity.setId(oldCity.getId());
             newCity.validate();
             collection.put(key, newCity);
-            asyncSave(); 
+            asyncSave();
             return true;
         }
         return false;
@@ -168,5 +171,9 @@ public class CollectionManager {
 
     public Set<Integer> getKeys() {
         return collection.keySet();
+    }
+
+    public void resetIdGenerator() { // новый публичный метод для сброса IdGenerator чтобы всякой херни не было больше
+        this.idGenerator.resetId();
     }
 }

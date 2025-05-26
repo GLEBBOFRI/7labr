@@ -11,7 +11,6 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.io.Serializable; // важно для Request/Response
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
@@ -72,6 +71,7 @@ public class ServerMain {
             Map<String, Command> commands = new HashMap<>();
             registerCommands(commands, collectionManager);
 
+            // Порт 12345 взят из ClientMain и docker-compose.yml
             new ServerMain(12345, collectionManager, commands).start();
         } catch (IOException | ValidationException e) {
             System.err.println("Failed to start server: " + e.getMessage());
@@ -82,7 +82,8 @@ public class ServerMain {
     public void start() {
         try (ServerSocketChannel serverChannel = ServerSocketChannel.open();
              Selector selector = Selector.open()) {
-            serverChannel.bind(new InetSocketAddress(port));
+            // *** ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ ЗДЕСЬ: ПРИВЯЗКА К "0.0.0.0" ***
+            serverChannel.bind(new InetSocketAddress("0.0.0.0", port));
             serverChannel.configureBlocking(false); // сам серверный канал неблокирующий
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
@@ -104,9 +105,6 @@ public class ServerMain {
                         if (key.isAcceptable()) {
                             accept(serverChannel, selector);
                         }
-                        // Удален блок if (key.isReadable()), так как клиентские каналы
-                        // теперь обрабатываются в блокирующем режиме в отдельных потоках
-                        // и не регистрируются с этим селектором для чтения.
                     }
                 }
             }
@@ -133,11 +131,6 @@ public class ServerMain {
     private void accept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel clientChannel = serverChannel.accept();
         if (clientChannel != null) {
-            // Важно: clientChannel по умолчанию будет неблокирующим, так как ServerSocketChannel неблокирующий.
-            // Мы НЕ регистрируем его с этим селектором для OP_READ.
-            // clientChannel.configureBlocking(false); // Эту строку удаляем, она избыточна или может вызвать проблемы
-            // clientChannel.register(selector, SelectionKey.OP_READ); // Эту строку удаляем!
-
             logger.info("клиент подключен: " + clientChannel.getRemoteAddress());
             // Передаем новый клиентский канал сразу в пул потоков для обработки
             executorService.submit(() -> {
@@ -159,13 +152,7 @@ public class ServerMain {
         }
     }
 
-    /**
-     * обрабатывает запросы от одного клиента.
-     * этот метод читает запросы, обрабатывает их и отправляет ответы,
-     * используя протокол "длина + данные".
-     *
-     * @param clientChannel канал клиента, с которым нужно работать.
-     */
+
     private void handleClient(SocketChannel clientChannel) throws IOException {
         try {
             // делаем канал блокирующим для операций чтения/записи в этом потоке.
@@ -184,9 +171,6 @@ public class ServerMain {
                         logger.info("клиент " + clientChannel.getRemoteAddress() + " корректно отключился.");
                         return; // клиент отключился
                     }
-                    // в блокирующем режиме read() должен блокировать, пока не будут доступны данные.
-                    // если bytes == 0, это может быть очень короткий таймаут или специфическое поведение системы.
-                    // для надежности, мы продолжаем цикл.
                     if (bytes == 0) {
                         continue;
                     }
@@ -211,7 +195,6 @@ public class ServerMain {
                         logger.info("клиент " + clientChannel.getRemoteAddress() + " отключился во время чтения данных.");
                         return; // клиент отключился
                     }
-                    // аналогично, в блокирующем режиме это не должно происходить.
                     if (bytes == 0) {
                         continue;
                     }
@@ -280,13 +263,6 @@ public class ServerMain {
                 new FilterStartsWithName(collectionManager));
     }
 
-    /**
-     * сериализует объект ответа в массив байтов, добавляя в начало его длину (4 байта).
-     * это важно для сетевого протокола, чтобы клиент знал, сколько байтов нужно прочитать.
-     * @param response объект ответа для сериализации.
-     * @return массив байтов, содержащий 4-байтовый префикс длины, за которым следует сериализованный объект ответа.
-     * @throws IOException если произошла ошибка ввода-вывода во время сериализации.
-     */
     private static byte[] serializeResponse(Response response) throws IOException {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
              ObjectOutputStream oos = new ObjectOutputStream(bos)) {
@@ -301,15 +277,7 @@ public class ServerMain {
         }
     }
 
-    /**
-     * десериализует массив байтов обратно в объект запроса.
-     * этот метод предполагает, что входной массив байтов содержит только сериализованные данные объекта запроса (без префикса длины).
-     * префикс длины обрабатывается логикой чтения сети в handleClient.
-     * @param data массив байтов, содержащий сериализованный объект запроса.
-     * @return десериализованный объект запроса.
-     * @throws IOException если произошла ошибка ввода-вывода во время десериализации.
-     * @throws ClassNotFoundException если класс десериализованного объекта не может быть найден.
-     */
+
     private static Request deserializeRequest(byte[] data) throws IOException, ClassNotFoundException {
         try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
              ObjectInputStream ois = new ObjectInputStream(bis)) {
