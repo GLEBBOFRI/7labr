@@ -2,14 +2,12 @@ package org.example.server.commands;
 
 import org.example.network.Request;
 import org.example.network.Response;
-import org.example.utils.IdGenerator;
 
 import java.util.Objects;
 
 public abstract class Command {
     private final String name;
     private final String description;
-    protected IdGenerator idGenerator;
 
     public Command(String name, String description) {
         this.name = name;
@@ -24,7 +22,14 @@ public abstract class Command {
         return description;
     }
 
-    public abstract Response execute(Request request);
+    /**
+     * Выполняет команду.
+     * @param request Запрос от клиента.
+     * @param authenticatedUsername Имя аутентифицированного пользователя, выполнившего запрос.
+     * Может быть null, если пользователь не аутентифицирован.
+     * @return Объект Response с результатом выполнения команды.
+     */
+    public abstract Response execute(Request request, String authenticatedUsername); // Изменена сигнатура
 
     @Override
     public boolean equals(Object o) {

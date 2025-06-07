@@ -1,6 +1,4 @@
-package org.example.collection.exceptions;
-
-import org.example.collection.exceptions.ControllerException;
+package org.example.database.exceptions;
 
 public class CommandNotFoundException extends ControllerException {
     public CommandNotFoundException(String commandName) {

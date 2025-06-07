@@ -1,14 +1,17 @@
 package org.example.server;
 
-import org.example.collection.CollectionManager;
-import org.example.collection.exceptions.ValidationException;
+import org.example.authentication.UserManager;
+import org.example.database.DatabaseManager;
+import org.example.database.CollectionManager;
 import org.example.network.Request;
 import org.example.network.Response;
+import org.example.server.commands.Command;
 import org.example.server.commands.*;
+import org.example.database.exceptions.ValidationException;
 
-import java.io.IOException;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.InetSocketAddress;
@@ -17,13 +20,16 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.FileHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -35,14 +41,42 @@ public class ServerMain {
     private final CollectionManager collectionManager;
     private final Map<String, Command> commands;
     private volatile boolean isRunning;
-    private final ExecutorService executorService; // пул потоков для обработки клиентов
+    private final ForkJoinPool commandExecutionPool;
+    private final ExecutorService responseSendingPool;
+    private final ReentrantLock collectionLock = new ReentrantLock();
+    private final UserManager userManager;
 
-    public ServerMain(int port, CollectionManager collectionManager, Map<String, Command> commands) {
+    private static class ClientState {
+        ByteBuffer headerBuffer = ByteBuffer.allocate(4);
+        ByteBuffer dataBuffer = null;
+        boolean readingHeader = true;
+
+        ByteBuffer responseBufferToSend = null;
+        Response responseToSend = null;
+
+        private final ReentrantLock channelWriteLock = new ReentrantLock();
+
+        public void reset() {
+            headerBuffer.clear();
+            readingHeader = true;
+            dataBuffer = null;
+            responseBufferToSend = null;
+            responseToSend = null;
+        }
+
+        public ReentrantLock getChannelWriteLock() {
+            return channelWriteLock;
+        }
+    }
+
+    public ServerMain(int port, CollectionManager collectionManager, Map<String, Command> commands, UserManager userManager) {
         this.port = port;
         this.collectionManager = collectionManager;
         this.commands = commands;
+        this.userManager = userManager;
         this.isRunning = true;
-        this.executorService = Executors.newFixedThreadPool(10); // размер пула потоков
+        this.commandExecutionPool = new ForkJoinPool();
+        this.responseSendingPool = Executors.newCachedThreadPool();
         setupLogger();
     }
 
@@ -54,27 +88,27 @@ public class ServerMain {
             logger.addHandler(fileHandler);
             logger.setLevel(Level.INFO);
         } catch (IOException e) {
-            System.err.println("Error setting up logger: " + e.getMessage());
+            System.err.println("Ошибка настройки логгера: " + e.getMessage());
         }
     }
 
     public static void main(String[] args) {
-        if (args.length == 0) {
-            System.err.println("Usage: java -jar server.jar <json_file>");
-            System.exit(1);
-        }
-
         try {
-            CollectionManager collectionManager = new CollectionManager();
-            collectionManager.loadCollection(args[0]);
+            DatabaseManager databaseManager = new DatabaseManager();
+            UserManager userManager = new UserManager(databaseManager);
+            CollectionManager collectionManager = new CollectionManager(databaseManager);
 
             Map<String, Command> commands = new HashMap<>();
-            registerCommands(commands, collectionManager);
+            registerCommands(commands, collectionManager, userManager);
 
-            // Порт 12345 взят из ClientMain и docker-compose.yml
-            new ServerMain(12345, collectionManager, commands).start();
-        } catch (IOException | ValidationException e) {
-            System.err.println("Failed to start server: " + e.getMessage());
+            new ServerMain(12345, collectionManager, commands, userManager).start();
+        } catch (SQLException e) {
+            System.err.println("Не удалось запустить сервер: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        } catch (Exception e) {
+            System.err.println("Неожиданная ошибка при запуске сервера: " + e.getMessage());
+            e.printStackTrace();
             System.exit(1);
         }
     }
@@ -82,18 +116,19 @@ public class ServerMain {
     public void start() {
         try (ServerSocketChannel serverChannel = ServerSocketChannel.open();
              Selector selector = Selector.open()) {
-            // *** ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ ЗДЕСЬ: ПРИВЯЗКА К "0.0.0.0" ***
+
             serverChannel.bind(new InetSocketAddress("0.0.0.0", port));
-            serverChannel.configureBlocking(false); // сам серверный канал неблокирующий
+            serverChannel.configureBlocking(false);
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
-            logger.info("сервер запущен на порту " + port);
+            logger.info("Сервер запущен на порту " + port);
 
             while (isRunning) {
-                selector.select(500); // неблокирующая операция ждет до 500 мс событий
-                if (!isRunning) { // проверка, не был ли сервер остановлен
+                selector.select(500);
+                if (!isRunning) {
                     break;
                 }
+
                 Set<SelectionKey> keys = selector.selectedKeys();
                 Iterator<SelectionKey> iterator = keys.iterator();
 
@@ -101,151 +136,223 @@ public class ServerMain {
                     SelectionKey key = iterator.next();
                     iterator.remove();
 
-                    if (key.isValid()) {
-                        if (key.isAcceptable()) {
-                            accept(serverChannel, selector);
+                    if (!key.isValid()) {
+                        continue;
+                    }
+
+                    if (key.isAcceptable()) {
+                        acceptConnection(key, selector);
+                    } else if (key.isReadable()) {
+                        readRequest(key);
+                    } else if (key.isWritable()) {
+                        ClientState clientState = (ClientState) key.attachment();
+                        if (clientState != null && clientState.responseBufferToSend != null) {
+                            responseSendingPool.submit(() -> {
+                                try {
+                                    sendResponse(
+                                            (SocketChannel) key.channel(), key, clientState, clientState.responseToSend);
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
                         }
                     }
                 }
             }
         } catch (IOException e) {
             if (isRunning) {
-                logger.log(Level.SEVERE, "ошибка сервера: " + e.getMessage(), e);
+                logger.log(Level.SEVERE, "Ошибка сервера: " + e.getMessage(), e);
             }
         } finally {
-            try {
-                executorService.shutdown(); // останавливаем пул потоков
-                // ждем завершения всех задач, до 10 секунд
-                if (!executorService.awaitTermination(10, TimeUnit.SECONDS)) {
-                    logger.warning("исполнитель не завершил работу вовремя, принудительное завершение.");
-                    executorService.shutdownNow();
-                }
-                collectionManager.shutdownSaveExecutor(); // теперь здесь, при полном завершении сервера
-            } catch (Exception e) {
-                logger.log(Level.SEVERE, "ошибка при завершении исполнителя или менеджера коллекции: " + e.getMessage(), e);
+            shutdownServer();
+            if (collectionManager != null) {
+                collectionManager.closeDatabaseConnection();
             }
-            logger.info("сервер остановлен");
+            logger.info("Сервер остановлен");
         }
     }
 
-    private void accept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
+    private void acceptConnection(SelectionKey key, Selector selector) throws IOException {
+        ServerSocketChannel serverChannel = (ServerSocketChannel) key.channel();
         SocketChannel clientChannel = serverChannel.accept();
         if (clientChannel != null) {
-            logger.info("клиент подключен: " + clientChannel.getRemoteAddress());
-            // Передаем новый клиентский канал сразу в пул потоков для обработки
-            executorService.submit(() -> {
-                try {
-                    handleClient(clientChannel);
-                } catch (Exception e) { // ловим все исключения, чтобы поток не упал
-                    try {
-                        logger.log(Level.SEVERE, "ошибка в потоке обработки клиента для " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
-                    } catch (IOException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                    try {
-                        clientChannel.close(); // закрываем канал при ошибке
-                    } catch (IOException ex) {
-                        logger.log(Level.SEVERE, "ошибка закрытия канала после исключения: " + ex.getMessage(), ex);
-                    }
-                }
-            });
+            clientChannel.configureBlocking(false);
+            clientChannel.register(selector, SelectionKey.OP_READ, new ClientState());
+            logger.info("Клиент подключен: " + clientChannel.getRemoteAddress());
         }
     }
 
+    private void readRequest(SelectionKey key) throws IOException {
+        SocketChannel clientChannel = (SocketChannel) key.channel();
+        ClientState clientState = (ClientState) key.attachment();
 
-    private void handleClient(SocketChannel clientChannel) throws IOException {
         try {
-            // делаем канал блокирующим для операций чтения/записи в этом потоке.
-            // это сильно упрощает логику, так как read() и write() будут ждать завершения.
-            // Эту строку теперь безопасно вызвать здесь, так как канал не зарегистрирован с Selector.
-            clientChannel.configureBlocking(true);
-
-            // цикл для обработки нескольких запросов от одного клиента
-            while (true) {
-                // 1. читаем 4-байтовый префикс длины запроса
-                ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
-                int totalBytesReadLength = 0;
-                while (totalBytesReadLength < 4) {
-                    int bytes = clientChannel.read(lengthBuffer);
-                    if (bytes == -1) {
-                        logger.info("клиент " + clientChannel.getRemoteAddress() + " корректно отключился.");
-                        return; // клиент отключился
-                    }
-                    if (bytes == 0) {
-                        continue;
-                    }
-                    totalBytesReadLength += bytes;
-                }
-                lengthBuffer.flip(); // готовим буфер длины к чтению
-                int requestLength = lengthBuffer.getInt(); // получаем ожидаемую длину запроса
-
-                // базовая проверка длины запроса, чтобы избежать ошибок памяти или вредоносных данных.
-                // предполагаем разумный максимальный размер запроса (например, 10 мб).
-                if (requestLength <= 0 || requestLength > 10 * 1024 * 1024) {
-                    logger.warning("получена неверная или чрезмерная длина запроса (" + requestLength + ") от " + clientChannel.getRemoteAddress() + ". закрываем соединение.");
-                    return; // закрываем соединение из-за неверной длины
-                }
-
-                // 2. читаем фактические данные запроса
-                ByteBuffer requestDataBuffer = ByteBuffer.allocate(requestLength);
-                int totalBytesReadData = 0;
-                while (totalBytesReadData < requestLength) {
-                    int bytes = clientChannel.read(requestDataBuffer);
-                    if (bytes == -1) {
-                        logger.info("клиент " + clientChannel.getRemoteAddress() + " отключился во время чтения данных.");
-                        return; // клиент отключился
-                    }
-                    if (bytes == 0) {
-                        continue;
-                    }
-                    totalBytesReadData += bytes;
-                }
-                requestDataBuffer.flip(); // готовим буфер данных к чтению
-
-                byte[] requestBytes = new byte[requestDataBuffer.remaining()];
-                requestDataBuffer.get(requestBytes);
-
-                Request request = deserializeRequest(requestBytes);
-
-                logger.info("получен запрос от " + clientChannel.getRemoteAddress() + ": " + request.getCommandName());
-                Command command = commands.get(request.getCommandName().toLowerCase());
-
-                Response response;
-                if (command == null) {
-                    response = new Response("команда не найдена");
-                    logger.warning("команда не найдена от " + clientChannel.getRemoteAddress() + ": " + request.getCommandName());
-                } else {
-                    response = command.execute(request);
-                    logger.info("выполнена команда '" + request.getCommandName() + "' для " + clientChannel.getRemoteAddress() + ", отправляем ответ.");
-                }
-
-                // 3. отправляем ответ (с префиксом длины)
-                byte[] responseBytes = serializeResponse(response);
-                ByteBuffer responseSendBuffer = ByteBuffer.wrap(responseBytes);
-                while (responseSendBuffer.hasRemaining()) { // гарантируем полную отправку
-                    clientChannel.write(responseSendBuffer);
-                }
-            }
-        } catch (IOException e) {
-            logger.log(Level.WARNING, "ошибка при обработке клиента " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
-        } catch (ClassNotFoundException e) {
-            logger.log(Level.SEVERE, "класс не найден во время десериализации для клиента " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
-        } catch (Exception e) { // ловим любые другие неожиданные исключения
-            logger.log(Level.SEVERE, "неожиданная ошибка в handleClient для " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
-        } finally {
-            try {
-                if (clientChannel.isOpen()) {
+            if (clientState.readingHeader) {
+                int bytesRead = clientChannel.read(clientState.headerBuffer);
+                if (bytesRead == -1) {
+                    logger.info("Клиент " + clientChannel.getRemoteAddress() + " корректно отключился.");
                     clientChannel.close();
-                    logger.log(Level.INFO, "сокет закрыт для " + clientChannel.getRemoteAddress());
+                    return;
                 }
-            } catch (IOException e) {
-                logger.log(Level.SEVERE, "ошибка закрытия клиентского сокета для " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+                if (clientState.headerBuffer.hasRemaining()) {
+                    return;
+                }
+                clientState.headerBuffer.flip();
+                int requestLength = clientState.headerBuffer.getInt();
+
+                if (requestLength <= 0 || requestLength > 10 * 1024 * 1024) {
+                    logger.warning("Получена неверная или чрезмерная длина запроса (" + requestLength + ") от " + clientChannel.getRemoteAddress() + ". Закрываем соединение.");
+                    clientChannel.close();
+                    return;
+                }
+                clientState.dataBuffer = ByteBuffer.allocate(requestLength);
+                clientState.readingHeader = false;
             }
+
+            int bytesRead = clientChannel.read(clientState.dataBuffer);
+            if (bytesRead == -1) {
+                logger.info("Клиент " + clientChannel.getRemoteAddress() + " отключился во время чтения данных.");
+                clientChannel.close();
+                return;
+            }
+            if (clientState.dataBuffer.hasRemaining()) {
+                return;
+            }
+
+            clientState.dataBuffer.flip();
+            byte[] requestBytes = new byte[clientState.dataBuffer.remaining()];
+            clientState.dataBuffer.get(requestBytes);
+
+            Request request = deserializeRequest(requestBytes);
+            logger.info("Получен запрос от " + clientChannel.getRemoteAddress() + ": " + request.getCommandName());
+
+            key.interestOps(0);
+
+            commandExecutionPool.submit(() -> {
+                Response response;
+                String authenticatedUsername = null;
+
+                String username = request.getUsername();
+                String password = request.getPassword();
+
+                if ("register".equalsIgnoreCase(request.getCommandName())) {
+                    if (username != null && password != null && !username.isEmpty() && !password.isEmpty()) {
+                        if (userManager.registerUser(username, password)) {
+                            response = new Response("Успешная регистрация. Вы вошли в систему как " + username + ".");
+                            authenticatedUsername = username;
+                        } else {
+                            response = new Response("Ошибка регистрации: Пользователь с таким именем уже существует или внутренняя ошибка.");
+                        }
+                    } else {
+                        response = new Response("Ошибка: Для регистрации требуются имя пользователя и пароль.");
+                    }
+                } else if ("login".equalsIgnoreCase(request.getCommandName())) {
+                    if (username != null && password != null && !username.isEmpty() && !password.isEmpty()) {
+                        if (userManager.authenticateUser(username, password)) {
+                            response = new Response("Успешный вход. Добро пожаловать, " + username + "!");
+                            authenticatedUsername = username;
+                        } else {
+                            response = new Response("Ошибка входа: Неверное имя пользователя или пароль.");
+                        }
+                    } else {
+                        response = new Response("Ошибка: Для входа требуются имя пользователя и пароль.");
+                    }
+                } else {
+                    if (username == null || password == null || username.isEmpty() || password.isEmpty() || !userManager.authenticateUser(username, password)) {
+                        response = new Response("Ошибка: Для выполнения этой команды необходима аутентификация. Пожалуйста, используйте 'register' или 'login'.");
+                    } else {
+                        authenticatedUsername = username;
+                        try {
+                            collectionLock.lock();
+                            Command command = commands.get(request.getCommandName().toLowerCase());
+                            if (command == null) {
+                                response = new Response("Команда не найдена.");
+                                logger.warning("Команда не найдена от " + clientChannel.getRemoteAddress() + ": " + request.getCommandName());
+                            } else {
+                                response = command.execute(request, authenticatedUsername);
+                                logger.info("Выполнена команда '" + request.getCommandName() + "' для " + authenticatedUsername + " (" + clientChannel.getRemoteAddress() + ").");
+                            }
+                        } catch (Exception e) {
+                            response = new Response("Ошибка при выполнении команды: " + e.getMessage());
+                            try {
+                                logger.log(Level.SEVERE, "Ошибка при выполнении команды для " + authenticatedUsername + " (" + clientChannel.getRemoteAddress() + "): " + e.getMessage(), e);
+                            } catch (IOException ex) {
+                                throw new RuntimeException(ex);
+                            }
+                        } finally {
+                            collectionLock.unlock();
+                        }
+                    }
+                }
+                try {
+                    sendResponse(clientChannel, key, clientState, response);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Ошибка чтения запроса от клиента " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+            try { clientChannel.close(); } catch (IOException ex) { logger.log(Level.SEVERE, "Ошибка закрытия канала: " + ex.getMessage()); }
+        } catch (ClassNotFoundException e) {
+            logger.log(Level.SEVERE, "Класс не найден во время десериализации запроса от клиента " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+            try { clientChannel.close(); } catch (IOException ex) { logger.log(Level.SEVERE, "Ошибка закрытия канала: " + ex.getMessage()); }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Неожиданная ошибка в readRequest для " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+            try { clientChannel.close(); } catch (IOException ex) { logger.log(Level.SEVERE, "Ошибка закрытия канала: " + ex.getMessage()); }
+        }
+    }
+
+    private void sendResponse(SocketChannel clientChannel, SelectionKey key, ClientState clientState, Response response) throws IOException {
+        clientState.getChannelWriteLock().lock();
+        try {
+            clientState.responseBufferToSend = ByteBuffer.wrap(serializeResponse(response));
+
+            while (clientState.responseBufferToSend.hasRemaining()) {
+                int bytesWritten = clientChannel.write(clientState.responseBufferToSend);
+                if (bytesWritten == 0) {
+                    TimeUnit.MILLISECONDS.sleep(1);
+                }
+            }
+            logger.info("Ответ отправлен клиенту " + clientChannel.getRemoteAddress());
+
+            clientState.reset();
+            key.selector().wakeup();
+            key.interestOps(SelectionKey.OP_READ);
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Ошибка отправки ответа клиенту " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+            try { clientChannel.close(); } catch (IOException ex) { logger.log(Level.SEVERE, "Ошибка закрытия канала: " + ex.getMessage()); }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Неожиданная ошибка в sendResponse для " + clientChannel.getRemoteAddress() + ": " + e.getMessage(), e);
+            try { clientChannel.close(); } catch (IOException ex) { logger.log(Level.SEVERE, "Ошибка закрытия канала: " + ex.getMessage()); }
+        } finally {
+            clientState.getChannelWriteLock().unlock();
+        }
+    }
+
+    private void shutdownServer() {
+        try {
+            commandExecutionPool.shutdown();
+            responseSendingPool.shutdown();
+            if (!commandExecutionPool.awaitTermination(10, TimeUnit.SECONDS)) {
+                logger.warning("Пул выполнения команд не завершился вовремя, принудительное завершение.");
+                commandExecutionPool.shutdownNow();
+            }
+            if (!responseSendingPool.awaitTermination(10, TimeUnit.SECONDS)) {
+                logger.warning("Пул отправки ответов не завершился вовремя, принудительное завершение.");
+                responseSendingPool.shutdownNow();
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Ошибка при завершении пулов потоков: " + e.getMessage(), e);
         }
     }
 
     private static void registerCommands(Map<String, Command> commands,
-                                         CollectionManager collectionManager) {
+                                         CollectionManager collectionManager,
+                                         UserManager userManager) {
+        commands.put("register", new RegisterCommand(userManager));
+        commands.put("login", new LoginCommand(userManager));
+
         commands.put("info", new Info(collectionManager));
         commands.put("show", new Show(collectionManager));
         commands.put("insert", new Insert(collectionManager));
@@ -269,14 +376,12 @@ public class ServerMain {
             oos.writeObject(response);
             byte[] objectBytes = bos.toByteArray();
 
-            // создаем новый буфер для хранения длины и данных
             ByteBuffer buffer = ByteBuffer.allocate(4 + objectBytes.length);
-            buffer.putInt(objectBytes.length); // записываем длину объекта (4 байта)
-            buffer.put(objectBytes);           // затем сами байты объекта
-            return buffer.array();             // возвращаем полный массив байтов
+            buffer.putInt(objectBytes.length);
+            buffer.put(objectBytes);
+            return buffer.array();
         }
     }
-
 
     private static Request deserializeRequest(byte[] data) throws IOException, ClassNotFoundException {
         try (ByteArrayInputStream bis = new ByteArrayInputStream(data);

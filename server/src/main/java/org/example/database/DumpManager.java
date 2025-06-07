@@ -1,8 +1,7 @@
-package org.example.collection;
+package org.example.database;
 
 import com.google.gson.*;
-import org.example.collection.models.City;
-import org.example.collection.exceptions.*;
+import org.example.database.models.City;
 
 import java.io.IOException;
 import java.nio.file.Files;

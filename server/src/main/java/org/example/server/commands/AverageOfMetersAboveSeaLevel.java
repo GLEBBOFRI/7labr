@@ -2,7 +2,7 @@ package org.example.server.commands;
 
 import org.example.network.Request;
 import org.example.network.Response;
-import org.example.collection.CollectionManager;
+import org.example.database.CollectionManager;
 
 public class AverageOfMetersAboveSeaLevel extends Command {
     private final CollectionManager collectionManager;
@@ -13,7 +13,8 @@ public class AverageOfMetersAboveSeaLevel extends Command {
     }
 
     @Override
-    public Response execute(Request request) {
+    public Response execute(Request request, String authenticatedUsername) { // Изменена сигнатура
+        // Для этой команды аутентификация не требуется, так как это просмотр.
         double average = collectionManager.getAverageMetersAboveSeaLevel();
         return new Response("среднее значение высоты над уровнем моря: " + average);
     }

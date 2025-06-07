@@ -1,4 +1,4 @@
-package org.example.collection.exceptions;
+package org.example.database.exceptions;
 
 public class EmptyFieldException extends ValidationException {
     public EmptyFieldException(String field) {

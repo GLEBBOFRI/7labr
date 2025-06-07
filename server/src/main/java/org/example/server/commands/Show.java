@@ -1,9 +1,9 @@
 package org.example.server.commands;
 
-import org.example.collection.models.City;
+import org.example.database.models.City;
 import org.example.network.Request;
 import org.example.network.Response;
-import org.example.collection.CollectionManager;
+import org.example.database.CollectionManager;
 import java.util.Collection;
 import java.util.stream.Collectors;
 
@@ -16,7 +16,8 @@ public class Show extends Command {
     }
 
     @Override
-    public Response execute(Request request) {
+    public Response execute(Request request, String authenticatedUsername) { // Изменена сигнатура
+        // Для этой команды аутентификация не требуется, так как это просмотр.
         Collection<City> cities = collectionManager.getSortedCollection();
         if (cities.isEmpty()) {
             return new Response("да тут пусто, показывать-то нечего");
